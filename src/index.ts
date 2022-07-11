@@ -1,5 +1,13 @@
-import { connect, Redis } from "https://deno.land/x/redis@v0.26.0/mod.ts";
+import {
+  connect,
+  RawOrError,
+  Redis,
+  RedisPipeline,
+} from "https://deno.land/x/redis@v0.26.0/mod.ts";
+import { idx } from "./idx.ts";
 import { Except } from "./types/Except.ts";
+import { RequireExactlyOne } from "./types/RequireExactlyOne.ts";
+import { zip } from "./zip.ts";
 
 type HexastoreOpts = {
   name: string;
@@ -9,7 +17,6 @@ type RedisOpts = {
   hostname: string;
   port: string;
 };
-
 
 export type HexastoreTriple = {
   predicate: string;
@@ -25,11 +32,46 @@ export type HexastoreFilter<T extends keyof HexastoreTriple> = {
   filter: HexastoreFilterStatement<T>;
 } & Partial<Except<HexastoreTriple, T>>;
 
+export type HexastoreHashEncoding =
+  | "spo"
+  | "sop"
+  | "pos"
+  | "osp"
+  | "pso"
+  | "ops";
+
+export type HexastoreHashEncodingChar = "s" | "o" | "p";
+
+export type HexastoreSearchStatement = {
+  [Key in keyof HexastoreTriple]: HexastoreTriple[Key] | symbol;
+};
+
+export type HexastoreSearchResult = {
+  [key: string]: Set<string>;
+};
+
+export type HexastorePagination = {
+  after?: HexastoreTriple;
+  first?: number;
+  before?: HexastoreTriple;
+  last?: number;
+};
+
+export type HexastoreCountParams = RequireExactlyOne<
+  {
+    cursor: HexastoreTriple;
+    query?: Partial<HexastoreTriple>;
+    filter?: HexastoreFilter<keyof HexastoreTriple>;
+  },
+  "query" | "filter"
+>;
+
 /**
  * When storing indices, we use compound keys in a sorted set.
  * This separator was chosen to avoid conflicts with either of the values.
  */
 const SEPARATOR = "\0\0";
+const DEFAULT_PAGE_SIZE = 100;
 
 export class Hexastore {
   private static instance: Hexastore;
@@ -39,12 +81,14 @@ export class Hexastore {
     this.name = opts.name;
   }
 
-  public async get(opts: HexastoreOpts & RedisOpts): Promise<Hexastore> {
+  public static async get(opts: HexastoreOpts & RedisOpts): Promise<Hexastore> {
+    console.log("try");
     const redis = await connect({
       hostname: opts.hostname,
       port: opts.port,
     });
 
+    console.log(redis)
     return new Hexastore(redis, opts);
   }
 
@@ -215,7 +259,7 @@ export class Hexastore {
     const param = filter.filter[0];
     const [min, max] = filter.filter[1];
     if (min === undefined && max === undefined) {
-      throw new Error(oneLineTrim`
+      throw new Error(`
         Filter ranges can't be open ended on both ends - you need to 
         provide either a max value, a min value, or both.
       `);
@@ -239,9 +283,458 @@ export class Hexastore {
       );
     }
 
-    throw new Error(oneLineTrim`
+    throw new Error(`
       Invalid Hexastore filter request:
       ${JSON.stringify(filter)}
     `);
+  }
+
+  /**
+   * Index a triple as an individual atomic operation
+   */
+  public async save(triple: HexastoreTriple): Promise<string[]>;
+
+  /**
+   * Index a triple using a given Redis pipeline. This is useful if you
+   * want to ensure that indices are always written together with the data
+   * you're indexing.
+   */
+  public async save(
+    triple: HexastoreTriple,
+    pipeline: RedisPipeline
+  ): Promise<string[]>;
+
+  public async save(
+    triple: HexastoreTriple,
+    pipeline?: RedisPipeline
+  ): Promise<string[]> {
+      console.log("saving")
+    const values = Hexastore.getHashes(triple);
+
+    const multi = pipeline || this.redis.pipeline();
+    values.forEach((value) => multi.zadd(this.getKey(), 0, value));
+    await multi.flush();
+
+    return values;
+  }
+
+  /**
+   * Index a triple, but only stage the changes to a Redis pipeline
+   * without executing the transaction
+   */
+  public stageSave(
+    triple: HexastoreTriple,
+    pipeline: RedisPipeline
+  ): RedisPipeline {
+    const values = Hexastore.getHashes(triple);
+    values.forEach((value) => pipeline.zadd(this.getKey(), 0, value));
+    return pipeline;
+  }
+
+  /**
+   * Delete indices for a triple
+   */
+  public async delete(triple: Partial<HexastoreTriple>): Promise<number>;
+
+  /**
+   * Delete indices for a triple using an existing Redis pipeline, ensuring
+   * atomicity.
+   */
+  public async delete(
+    triple: Partial<HexastoreTriple>,
+    pipeline: RedisPipeline
+  ): Promise<RawOrError[] | number>;
+
+  public async delete(
+    triple: Partial<HexastoreTriple>,
+    pipeline?: RedisPipeline
+  ): Promise<RawOrError[] | number> {
+    // For partial triples, remove the range
+    const [start, end] = Hexastore.getHashRange(triple);
+    if (end !== undefined) {
+      if (pipeline) {
+        pipeline.zremrangebylex(this.getKey(), start, end);
+        return pipeline.flush();
+      } else {
+        return this.redis.zremrangebylex(this.getKey(), start, end);
+      }
+    }
+
+    // For fully-defined triples, remove all indices
+    const values = Hexastore.getHashes({
+      subject: idx(triple.subject),
+      object: idx(triple.object),
+      predicate: idx(triple.predicate),
+    });
+
+    const multi = pipeline ?? this.redis.tx();
+    values.forEach((value) => multi.zrem(this.getKey(), value));
+    await multi.flush();
+
+    return values.length;
+  }
+
+  /**
+   * Stage a triple deletion, but don't execute the pipeline
+   */
+  public stageDelete(
+    triple: HexastoreTriple,
+    pipeline: RedisPipeline
+  ): RedisPipeline {
+    const [start, end] = Hexastore.getHashRange(triple);
+    if (end !== undefined) {
+      pipeline.zremrangebylex(this.getKey(), start, end);
+      return pipeline;
+    }
+
+    pipeline.zrem(this.getKey(), start);
+    return pipeline;
+  }
+
+  private static getTripleHash(
+    encoding: HexastoreHashEncoding,
+    triple: HexastoreTriple
+  ): string {
+    const chars = encoding.split("") as HexastoreHashEncodingChar[];
+    const hash = chars.map((char) => {
+      switch (char) {
+        case "s":
+          return triple.subject;
+        case "o":
+          return triple.object;
+        case "p":
+          return triple.predicate;
+      }
+    });
+
+    return `${encoding}${SEPARATOR}${hash.join(SEPARATOR)}`;
+  }
+
+  private static getNameFromEncodingChar(
+    char: HexastoreHashEncodingChar
+  ): string {
+    switch (char) {
+      case "s":
+        return "subject";
+      case "p":
+        return "predicate";
+      case "o":
+        return "object";
+      default:
+        break;
+    }
+
+    throw new Error(`
+      Bad SOP character input. Expected "s", "o" or "p", got "${char}"
+    `);
+  }
+
+  private static getEncodingFromHash(hash: string): HexastoreHashEncoding {
+    const [encoding] = hash.split(SEPARATOR);
+    // Remove Redis exclusive/inclusive specifier (first char)
+    return encoding.slice(1) as HexastoreHashEncoding;
+  }
+
+  // Given a start and an end index, query all of the values in that range
+  private async queryRange(
+    start: string,
+    end: string,
+    pagination?: HexastorePagination
+  ): Promise<HexastoreTriple[]> {
+    const [startEncoding, endEncoding] = [
+      Hexastore.getEncodingFromHash(start),
+      Hexastore.getEncodingFromHash(end),
+    ];
+
+    if (startEncoding !== endEncoding) {
+      throw new Error(`
+        Invalid query range provided. The start and end encoding has to be 
+        the same, received ${start} and ${end}.
+      `);
+    }
+
+    let hashes: string[] = [];
+    if (!pagination) {
+      pagination = {
+        first: DEFAULT_PAGE_SIZE,
+      };
+    }
+
+    const { first, last, after, before } = pagination;
+
+    if ((first || after) && (last || before)) {
+      throw new Error(`
+        Invalid pagination parameters. You can either paginate forward 
+        using { first, after } or backwards using { last, before }. 
+        Received ${JSON.stringify(pagination)}
+      `);
+    }
+
+    if (first || after) {
+      const limit = first ?? DEFAULT_PAGE_SIZE;
+      start = after
+        ? `(${Hexastore.getTripleHash(startEncoding, after)}`
+        : start;
+
+      hashes = await this.redis.zrangebylex(this.getKey(), start, end, {
+        limit: {
+          offset: 0,
+          count: limit,
+        },
+      });
+    } else if (last || before) {
+      const limit = last ?? DEFAULT_PAGE_SIZE;
+      end = before ? `(${Hexastore.getTripleHash(startEncoding, before)}` : end;
+
+      hashes = await this.redis.zrevrangebylex(this.getKey(), end, start, {
+        limit: {
+          offset: 0,
+          count: limit,
+        },
+      });
+    }
+
+    if (!hashes) {
+      throw new Error("No results");
+    }
+
+    return hashes.map((hash: string) => {
+      const [keys, seg1, seg2, seg3] = hash.split(SEPARATOR);
+
+      const zipped = zip(keys.split(""), [seg1, seg2, seg3]);
+
+      return {
+        [Hexastore.getNameFromEncodingChar(
+          zipped[0][0] as HexastoreHashEncodingChar
+        )]: zipped[0][1],
+        [Hexastore.getNameFromEncodingChar(
+          zipped[1][0] as HexastoreHashEncodingChar
+        )]: zipped[1][1],
+        [Hexastore.getNameFromEncodingChar(
+          zipped[2][0] as HexastoreHashEncodingChar
+        )]: zipped[2][1],
+      } as HexastoreTriple;
+    });
+  }
+
+  // Query indices that match a given partial triple.
+  public async query(
+    query: Partial<HexastoreTriple>,
+    pagination?: HexastorePagination
+  ): Promise<HexastoreTriple[]> {
+      
+      console.log("querying");
+    const [start, end] = Hexastore.getHashRange(query);
+
+    if (!end) {
+      const exists = await this.redis.zscore(this.getKey(), start);
+      if (exists !== null) {
+        return [
+          {
+            subject: idx(query.subject),
+            predicate: idx(query.predicate),
+            object: idx(query.object),
+          },
+        ];
+      } else {
+        return [];
+      }
+    }
+
+    return this.queryRange(start, end, pagination);
+  }
+
+  public async count(
+    direction: "before" | "after",
+    params: HexastoreCountParams
+  ): Promise<number> {
+    const { cursor, query, filter } = params;
+
+    if (query && filter) {
+      throw new Error(`
+        You can count leading/trailing triples using either
+        a query and cursor, or a filter and cursor, but not both.
+      `);
+    }
+
+    if (!query && !filter) {
+      throw new Error(`
+        You can't count leading/trailing triples without
+        specifying a query or filter.
+      `);
+    }
+
+    let start = "";
+    let end = "";
+
+    if (query) {
+      const [maybeStart, maybeEnd] = Hexastore.getHashRange(query);
+      if (!maybeEnd) {
+        /**
+         * A full query was specified so we only have 1 result, and no
+         * leading/trailing triples.
+         */
+        return 0;
+      }
+
+      [start, end] = [maybeStart, maybeEnd];
+    }
+
+    if (filter) {
+      [start, end] = Hexastore.getHashFilterRange(filter);
+    }
+
+    const startEncoding = Hexastore.getEncodingFromHash(start);
+    switch (direction) {
+      case "after": {
+        start = cursor
+          ? `(${Hexastore.getTripleHash(startEncoding, cursor)}`
+          : start;
+
+        return await this.redis.zlexcount(this.getKey(), start, end);
+      }
+      case "before": {
+        end = cursor
+          ? `(${Hexastore.getTripleHash(startEncoding, cursor)}`
+          : end;
+
+        return await this.redis.zlexcount(this.getKey(), start, end);
+      }
+    }
+  }
+
+  // Query indices that match a given filter
+  public async filter<T extends keyof HexastoreTriple>(
+    filter: HexastoreFilter<T>,
+    pagination?: HexastorePagination
+  ): Promise<HexastoreTriple[]> {
+    const [start, end] = Hexastore.getHashFilterRange(filter);
+    return await this.queryRange(start, end, pagination);
+  }
+
+  /**
+   * Symbol is scoped to this instance - can't declare this
+   * method as static since we won't have access to the
+   * symbol we generated anymore
+   */
+  // eslint-disable-next-line class-methods-use-this
+  public v(variableName: string): symbol {
+    return Symbol.for(variableName);
+  }
+
+  protected static isComplexStatement({
+    subject,
+    predicate,
+    object,
+  }: HexastoreSearchStatement): boolean {
+    const isSym = (part: unknown): boolean => typeof part === "symbol";
+    if (isSym(subject) && isSym(predicate) && isSym(object)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Allow querying the hexastore by providing statements (which are really just
+   * partial triples). An example would be getting all of the users
+   * related to a company, and all the intermediary objects for the
+   * specified path.
+   *
+   * const hexastore = Hexastore.get("graph");
+   * const A = hexastore.v("companies");
+   * const B = hexastore.v("users");
+   *
+   * const usersRelatedToShop = await hexastore.search([
+   *   { subject: shopID, predicate: "owned_by", object: A},
+   *   { subject: A, predicate: "shareholder", object: B },
+   *
+   * console.log(usersRelatedToShop);
+   * {
+   *   companies: Set[...],
+   *   entities: Set[...]
+   * }
+   *
+   */
+  public async search(
+    statements: HexastoreSearchStatement[]
+  ): Promise<HexastoreSearchResult> {
+    const results: { filteredResults: HexastoreTriple[] }[] = [];
+    const materialized: { [key: string]: Set<string> } = {};
+
+    for (const statement of statements) {
+      if (Hexastore.isComplexStatement(statement)) {
+        const subject = Symbol.keyFor(statement.subject as symbol);
+        const predicate = Symbol.keyFor(statement.predicate as symbol);
+        const object = Symbol.keyFor(statement.object as symbol);
+
+        throw new Error(`
+          Complex queries, with three variables per statement, 
+          are not permitted at the moment. Received 
+          "{ subject: ${subject}, predicate: ${predicate}, object: ${object} }"
+        `);
+      }
+
+      const query = statement;
+      const targets: { [key: string]: keyof HexastoreTriple } = {};
+
+      for (const [key, part] of Object.entries(statement)) {
+        if (typeof part === "symbol") {
+          // Get variable symbol key
+          const symbolKey = Symbol.keyFor(part);
+
+          // If no key in local scope, the user didn't use hexastore.v()
+          if (!symbolKey) {
+            throw new Error(`Variable ${part.toString()} unknown`);
+          }
+
+          // Add the variables to targets as { var: keyof HexastoreTriple }
+          targets[symbolKey] = key as keyof HexastoreTriple;
+          // And remove the variable from the query to get the partial
+          delete query[key as keyof HexastoreTriple];
+        }
+      }
+
+      /**
+       *  Query partial edge. We actually need to use await here since
+       *  the individual queries are dependent on each other and they should
+       *  run serially.
+       */
+      // eslint-disable-next-line no-await-in-loop
+      const result = await this.query(query as Partial<HexastoreTriple>);
+
+      const filteredResults: HexastoreTriple[] = [];
+      // If we have materialized variables
+      if (Object.keys(materialized).length) {
+        // Walk the results
+        for (const triple of result) {
+          // Look at the current variable targets
+          for (const [key, target] of Object.entries(targets)) {
+            /**
+             * If we materialized one of the variables in the current
+             * statement, push it to the filtered results
+             */
+            if (materialized[key] && materialized[key].has(triple[target])) {
+              filteredResults.push(triple);
+            }
+          }
+        }
+      } else {
+        // With no materialized variables, just assign the full result
+        filteredResults.push(...result);
+      }
+
+      // Set all current targets as materialized, with the result values
+      for (const [key, target] of Object.entries(targets)) {
+        materialized[key] = new Set(
+          filteredResults.map((triple) => triple[target])
+        );
+      }
+
+      results.push({
+        filteredResults,
+      });
+    }
+
+    return materialized;
   }
 }

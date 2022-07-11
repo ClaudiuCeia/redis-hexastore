@@ -61,15 +61,6 @@ const SEPARATOR = "\0\0";
 
 const DEFAULT_PAGE_SIZE = 100;
 
-/**
- * TODO: issue #430 - redis-js incompatibility. redis-js does a
- * strict equality check for "limit", but the official command is
- * "LIMIT". So we switch between these two depending on environment
- * for now. The same applies to "MATCH" and "WITHSCORES":
- *
- * https://github.com/wilkenstein/redis-mock-js/blob/master/redis-mock.js#L2114
- */
-
 const LIMIT = "LIMIT";
 
 export class Hexastore {
