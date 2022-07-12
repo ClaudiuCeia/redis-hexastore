@@ -11,11 +11,12 @@ import { zip } from "./zip.ts";
 
 type HexastoreOpts = {
   name: string;
+  prefix?: string;
 };
 
 type RedisOpts = {
   hostname: string;
-  port: string;
+  port: number;
 };
 
 export type HexastoreTriple = {
@@ -74,27 +75,30 @@ const SEPARATOR = "\0\0";
 const DEFAULT_PAGE_SIZE = 100;
 
 export class Hexastore {
-  private static instance: Hexastore;
-  private readonly name: string;
+  private constructor(
+    private redis: Redis,
+    private redisOpts: RedisOpts,
+    private options: HexastoreOpts
+  ) {}
 
-  private constructor(private redis: Redis, opts: HexastoreOpts) {
-    this.name = opts.name;
-  }
-
-  public static async get(opts: HexastoreOpts & RedisOpts): Promise<Hexastore> {
-    console.log("try");
+  public static async get(
+    redisOpts: RedisOpts,
+    opts: HexastoreOpts
+  ): Promise<Hexastore> {
     const redis = await connect({
-      hostname: opts.hostname,
-      port: opts.port,
+      hostname: redisOpts.hostname,
+      port: redisOpts.port,
     });
 
-    console.log(redis)
-    return new Hexastore(redis, opts);
+    return new Hexastore(redis, redisOpts, {
+      ...opts,
+      prefix: opts.prefix || "hexastore",
+    });
   }
 
   // Get the Redis key for this hexastore store
   public getKey(): string {
-    return `index:hex:${this.name}`;
+    return `${this.options.prefix}:${this.options.name}`;
   }
 
   // Get index values for a triple
@@ -308,14 +312,53 @@ export class Hexastore {
     triple: HexastoreTriple,
     pipeline?: RedisPipeline
   ): Promise<string[]> {
-      console.log("saving")
     const values = Hexastore.getHashes(triple);
 
-    const multi = pipeline || this.redis.pipeline();
-    values.forEach((value) => multi.zadd(this.getKey(), 0, value));
-    await multi.flush();
+    let newClient: Redis | undefined;
+    if (!pipeline) {
+      newClient = await connect(this.redisOpts);
+      pipeline = newClient.pipeline();
+    }
+
+    for (const value of values) {
+      pipeline.zadd(this.getKey(), 0, value);
+    }
+
+    await pipeline.flush();
+
+    if (newClient) {
+      newClient.close();
+    }
 
     return values;
+  }
+
+  public async batchSave(triples: HexastoreTriple[]): Promise<void>;
+
+  public async batchSave(
+    triples: HexastoreTriple[],
+    pipeline: RedisPipeline
+  ): Promise<void>;
+
+  public async batchSave(
+    triples: HexastoreTriple[],
+    pipeline?: RedisPipeline
+  ): Promise<void> {
+    let newClient: Redis | undefined;
+    if (!pipeline) {
+      newClient = await connect(this.redisOpts);
+      pipeline = newClient.pipeline();
+    }
+
+    for (const triple of triples) {
+      this.stageSave(triple, pipeline);
+    }
+
+    await pipeline.flush();
+
+    if (newClient) {
+      newClient.close();
+    }
   }
 
   /**
@@ -367,9 +410,21 @@ export class Hexastore {
       predicate: idx(triple.predicate),
     });
 
-    const multi = pipeline ?? this.redis.tx();
-    values.forEach((value) => multi.zrem(this.getKey(), value));
-    await multi.flush();
+    let newClient: Redis | undefined;
+    if (!pipeline) {
+      newClient = await connect(this.redisOpts);
+      pipeline = newClient.pipeline();
+    }
+
+    for (const value of values) {
+      pipeline.zrem(this.getKey(), value);
+    }
+
+    await pipeline.flush();
+
+    if (newClient) {
+      newClient.close();
+    }
 
     return values.length;
   }
@@ -378,7 +433,7 @@ export class Hexastore {
    * Stage a triple deletion, but don't execute the pipeline
    */
   public stageDelete(
-    triple: HexastoreTriple,
+    triple: Partial<HexastoreTriple>,
     pipeline: RedisPipeline
   ): RedisPipeline {
     const [start, end] = Hexastore.getHashRange(triple);
@@ -389,6 +444,38 @@ export class Hexastore {
 
     pipeline.zrem(this.getKey(), start);
     return pipeline;
+  }
+
+  public async batchDelete(
+    triples: Partial<HexastoreTriple>[]
+  ): Promise<number>;
+
+  public async batchDelete(
+    triples: Partial<HexastoreTriple>[],
+    pipeline: RedisPipeline
+  ): Promise<RawOrError[] | number>;
+
+  public async batchDelete(
+    triples: Partial<HexastoreTriple>[],
+    pipeline?: RedisPipeline
+  ): Promise<RawOrError[] | number> {
+    let newClient: Redis | undefined;
+    if (!pipeline) {
+      newClient = await connect(this.redisOpts);
+      pipeline = newClient.pipeline();
+    }
+
+    for (const triple of triples) {
+      this.stageDelete(triple, pipeline);
+    }
+
+    const res = await pipeline.flush();
+
+    if (newClient) {
+      newClient.close();
+    }
+
+    return res;
   }
 
   private static getTripleHash(
@@ -522,8 +609,6 @@ export class Hexastore {
     query: Partial<HexastoreTriple>,
     pagination?: HexastorePagination
   ): Promise<HexastoreTriple[]> {
-      
-      console.log("querying");
     const [start, end] = Hexastore.getHashRange(query);
 
     if (!end) {
@@ -736,5 +821,9 @@ export class Hexastore {
     }
 
     return materialized;
+  }
+
+  public close(): void {
+    return this.redis.close();
   }
 }
