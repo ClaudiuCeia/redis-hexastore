@@ -87,12 +87,7 @@ export class Hexastore {
     redisOpts: RedisOpts,
     opts: HexastoreOpts
   ): Promise<Hexastore> {
-    const redis = await connect({
-      hostname: redisOpts.hostname,
-      port: redisOpts.port,
-      password: redisOpts.password ?? undefined,
-      username: redisOpts.username ?? undefined,
-    });
+    const redis = await connect(redisOpts);
 
     return new Hexastore(redis, redisOpts, {
       ...opts,
