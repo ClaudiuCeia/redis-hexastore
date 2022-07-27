@@ -17,6 +17,8 @@ type HexastoreOpts = {
 type RedisOpts = {
   hostname: string;
   port: number;
+  password?: string,
+  username?: string,
 };
 
 export type HexastoreTriple = {
@@ -88,6 +90,8 @@ export class Hexastore {
     const redis = await connect({
       hostname: redisOpts.hostname,
       port: redisOpts.port,
+      password: redisOpts.password ?? undefined,
+      username: redisOpts.username ?? undefined,
     });
 
     return new Hexastore(redis, redisOpts, {
