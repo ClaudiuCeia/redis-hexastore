@@ -127,5 +127,52 @@ Deno.test("Simple query", async () => {
     },
   ]);
 
+  const who = hexastore.v("who");
+  const what = hexastore.v("what");
+  const where = hexastore.v("where");
+
+  const query = await hexastore.search([
+    { subject: who, predicate: "likes", object: what },
+    { subject: who, predicate: "lives", object: where },
+  ]);
+
+  assertEquals(query, {
+    what: new Set(["beer"]),
+    where: new Set(["Germany", "Romania"]),
+    who: new Set(["Adrian", "Ana"]),
+  });
+
+  const filter = await hexastore.filter({
+    filter: ["predicate", ["lia", "liz"]],
+  });
+
+  assertEquals(filter, [
+    {
+      object: "beer",
+      predicate: "likes",
+      subject: "Adrian",
+    },
+    {
+      object: "beer",
+      predicate: "likes",
+      subject: "Ana",
+    },
+    {
+      object: "Germany",
+      predicate: "lives",
+      subject: "Ana",
+    },
+    {
+      object: "Germany",
+      predicate: "lives",
+      subject: "Erika",
+    },
+    {
+      object: "Romania",
+      predicate: "lives",
+      subject: "Adrian",
+    },
+  ]);
+
   hexastore.close();
 });

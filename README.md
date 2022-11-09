@@ -88,3 +88,7 @@ const beerLikers = await hexastore.query({
 
 hexastore.close();
 ```
+
+# License
+
+MIT © [Claudiu Ceia](https://github.com/ClaudiuCeia)
